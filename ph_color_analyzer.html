@@ -1,0 +1,321 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Analizador de pH por Color</title>
+    <!-- Configuración PWA y para iOS -->
+    <!-- Define el color de la barra de estado del navegador -->
+    <meta name="theme-color" content="#4f46e5">
+    <!-- Habilita el modo de pantalla completa en iOS -->
+    <meta name="apple-mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+    <!-- En un entorno real, aquí iría: <link rel="manifest" href="manifest.json"> -->
+    <!-- Carga de Tailwind CSS -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <!-- Carga de la fuente Inter -->
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@100..900&display=swap');
+        body {
+            font-family: 'Inter', sans-serif;
+            background-color: #f7f7f7;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            min-height: 100vh;
+        }
+        /* Estilos específicos para el video/canvas */
+        #video, #canvas {
+            border-radius: 1rem;
+            box-shadow: 0 10px 15px rgba(0, 0, 0, 0.1);
+            width: 100%;
+            max-width: 400px; /* Limitar el ancho en desktop */
+            height: auto;
+            aspect-ratio: 4/3; /* Proporción estándar para cámaras */
+            object-fit: cover;
+        }
+        .container {
+            min-width: 320px;
+        }
+    </style>
+</head>
+<body class="p-4">
+
+    <div class="container bg-white p-6 md:p-8 rounded-2xl shadow-xl w-full max-w-lg">
+        <h1 class="text-3xl font-bold text-center text-indigo-700 mb-6">
+            🧪 Analizador de pH por Color
+        </h1>
+        <p class="text-center text-gray-600 mb-6">
+            Enfoca la tira indicadora de pH y toca "Capturar" para analizar el color.
+        </p>
+
+        <!-- Área de Video y Canvas -->
+        <div class="relative mb-6 flex justify-center">
+            <video id="video" autoplay playsinline class="block"></video>
+            <canvas id="canvas" class="hidden"></canvas>
+        </div>
+
+        <!-- Controles y Mensajes -->
+        <div class="flex flex-col space-y-4">
+            <button id="captureButton"
+                    class="w-full bg-indigo-600 text-white py-3 rounded-xl font-semibold text-lg shadow-md hover:bg-indigo-700 transition duration-300">
+                Capturar y Analizar Color
+            </button>
+
+            <div id="loadingIndicator" class="hidden text-center text-indigo-600 font-medium">
+                <div class="flex items-center justify-center space-x-2">
+                    <svg class="animate-spin h-5 w-5 text-indigo-600" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+                        <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
+                        <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+                    </svg>
+                    <span>Analizando el color...</span>
+                </div>
+            </div>
+
+            <!-- Panel de Resultados -->
+            <div id="resultPanel" class="hidden bg-green-50 border-l-4 border-green-500 text-green-800 p-4 rounded-lg mt-4">
+                <p class="font-bold text-lg mb-1">Resultado Estimado:</p>
+                <div id="resultContent"></div>
+            </div>
+
+            <!-- Panel de Errores/Info -->
+            <div id="infoMessage" class="bg-yellow-100 border-l-4 border-yellow-500 text-yellow-800 p-4 rounded-lg mt-4">
+                Cargando cámara... Por favor, permite el acceso a la cámara.
+            </div>
+        </div>
+    </div>
+
+    <script type="module">
+        // Importación de las funciones de Firebase (aunque no se usa Firestore, el entorno lo requiere)
+        // Se incluyen las importaciones de auth para cumplir con el protocolo de autenticación del entorno.
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+        import { getAuth, signInAnonymously, signInWithCustomToken } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+        import { getFirestore } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+
+        // Variables globales proporcionadas por el entorno (deben ser usadas)
+        const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+        const firebaseConfig = JSON.parse(typeof __firebase_config !== 'undefined' ? __firebase_config : '{}');
+        const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
+
+        // Elementos del DOM
+        const video = document.getElementById('video');
+        const canvas = document.getElementById('canvas');
+        const context = canvas.getContext('2d');
+        const captureButton = document.getElementById('captureButton');
+        const loadingIndicator = document.getElementById('loadingIndicator');
+        const resultPanel = document.getElementById('resultPanel');
+        const resultContent = document.getElementById('resultContent');
+        const infoMessage = document.getElementById('infoMessage');
+
+        // Configuración de la API de Gemini
+        const apiKey = ""; // La clave se proporciona automáticamente en este entorno
+        const apiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-09-2025:generateContent?key=${apiKey}`;
+
+        let stream = null; // Para almacenar el flujo de la cámara
+
+        /**
+         * 1. Inicializa Firebase y autentica al usuario.
+         * Aunque esta app no usa Firestore, es necesario inicializar la autenticación
+         * para cumplir con las directrices del entorno.
+         */
+        async function initializeAuth() {
+            try {
+                const app = initializeApp(firebaseConfig);
+                const auth = getAuth(app);
+                getFirestore(app); // Inicializa Firestore (aunque no se use)
+
+                if (initialAuthToken) {
+                    await signInWithCustomToken(auth, initialAuthToken);
+                } else {
+                    await signInAnonymously(auth);
+                }
+                console.log("Autenticación Firebase completada.");
+            } catch (error) {
+                console.error("Error en la autenticación Firebase:", error);
+            }
+        }
+
+        /**
+         * 2. Inicia el flujo de la cámara del usuario.
+         */
+        async function startCamera() {
+            try {
+                // Solicitar la cámara trasera si está disponible (preferible para apps móviles),
+                // o cualquier otra cámara si no lo está.
+                const constraints = {
+                    video: {
+                        facingMode: { ideal: "environment" } // Priorizar cámara trasera
+                    }
+                };
+                
+                stream = await navigator.mediaDevices.getUserMedia(constraints);
+                video.srcObject = stream;
+                
+                // Ocultar mensaje de info una vez que la cámara esté lista
+                video.addEventListener('loadedmetadata', () => {
+                    infoMessage.classList.add('hidden');
+                    captureButton.disabled = false;
+                }, { once: true });
+
+            } catch (err) {
+                console.error("Error al acceder a la cámara:", err);
+                infoMessage.textContent = 'Error: No se pudo acceder a la cámara. Asegúrate de que el navegador tenga permiso.';
+                infoMessage.classList.remove('bg-yellow-100', 'text-yellow-800');
+                infoMessage.classList.add('bg-red-100', 'text-red-800');
+                captureButton.disabled = true;
+            }
+        }
+
+        /**
+         * 3. Captura un frame del video y lo convierte a Base64.
+         */
+        function captureFrame() {
+            // Asegurarse de que el canvas tenga el mismo tamaño que el video visible
+            canvas.width = video.videoWidth;
+            canvas.height = video.videoHeight;
+            context.drawImage(video, 0, 0, canvas.width, canvas.height);
+            
+            // Ocultar el video y mostrar el canvas con la imagen capturada temporalmente
+            video.classList.add('hidden');
+            canvas.classList.remove('hidden');
+
+            // Devolver la imagen capturada como Base64 (PNG)
+            return canvas.toDataURL('image/png');
+        }
+
+        /**
+         * 4. Llama a la API de Gemini para analizar la imagen y estimar el pH.
+         * @param {string} base64Image - La imagen capturada en formato base64 con prefijo MIME.
+         */
+        async function analyzeColor(base64Image) {
+            // Extraer solo los datos base64, eliminando el prefijo "data:image/png;base64,"
+            const base64Data = base64Image.split(',')[1];
+            
+            // Configuración del payload para la llamada a la API
+            const systemPrompt = "Eres un químico experto y analista de color. Tu tarea es analizar el color de la muestra provista en la imagen y estimar el valor de pH de la sustancia basándote en una escala de indicador universal estándar (rojo/naranja = ácido fuerte, amarillo/verde = neutro/ácido débil, azul/morado = base). Responde siempre con el valor de pH estimado (un número entre 1 y 14) y una breve justificación en español, sin usar encabezados markdown.";
+            const userQuery = "Analiza el color principal de esta muestra (asume que es una tira de pH o líquido con indicador universal) y dime el valor de pH estimado. La justificación debe ser concisa.";
+
+            const payload = {
+                contents: [
+                    {
+                        role: "user",
+                        parts: [
+                            { text: userQuery },
+                            {
+                                inlineData: {
+                                    mimeType: "image/png",
+                                    data: base64Data
+                                }
+                            }
+                        ]
+                    }
+                ],
+                systemInstruction: {
+                    parts: [{ text: systemPrompt }]
+                },
+            };
+
+            // Intentar con backoff exponencial
+            const maxRetries = 5;
+            let currentRetry = 0;
+            let response;
+            
+            while (currentRetry < maxRetries) {
+                try {
+                    response = await fetch(apiUrl, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify(payload)
+                    });
+
+                    if (response.ok) {
+                        break; // Salir del bucle si la respuesta es exitosa
+                    } else if (response.status === 429) {
+                        // Manejo de Tasa Limitada (Throttle)
+                        currentRetry++;
+                        if (currentRetry >= maxRetries) throw new Error("Máximo de reintentos alcanzado.");
+                        const delay = Math.pow(2, currentRetry) * 1000;
+                        await new Promise(resolve => setTimeout(resolve, delay));
+                    } else {
+                        // Otros errores de respuesta
+                        throw new Error(`Error HTTP: ${response.status}`);
+                    }
+                } catch (error) {
+                    currentRetry++;
+                    if (currentRetry >= maxRetries) throw error; // Re-lanzar error si se acabaron los reintentos
+                    const delay = Math.pow(2, currentRetry) * 1000;
+                    await new Promise(resolve => setTimeout(resolve, delay));
+                }
+            }
+
+            if (!response || !response.ok) {
+                throw new Error("Fallo al contactar al modelo después de varios reintentos.");
+            }
+
+            const result = await response.json();
+            const text = result.candidates?.[0]?.content?.parts?.[0]?.text;
+
+            if (text) {
+                return text.trim();
+            } else {
+                throw new Error("Respuesta del modelo vacía o inesperada.");
+            }
+        }
+
+        /**
+         * 5. Maneja el flujo completo al hacer clic en el botón.
+         */
+        async function handleCapture() {
+            captureButton.disabled = true;
+            loadingIndicator.classList.remove('hidden');
+            resultPanel.classList.add('hidden');
+            resultContent.innerHTML = '';
+            infoMessage.classList.add('hidden');
+
+            try {
+                // 1. Capturar la imagen
+                const base64Image = captureFrame();
+
+                // 2. Analizar el color con el LLM
+                const resultText = await analyzeColor(base64Image);
+
+                // 3. Mostrar el resultado
+                resultContent.innerHTML = resultText.replace(/\n/g, '<br>'); // Mantener saltos de línea
+                resultPanel.classList.remove('hidden');
+
+            } catch (error) {
+                console.error("Error durante la captura o el análisis:", error);
+                // Mostrar la imagen de error en el panel de resultados
+                resultPanel.classList.remove('hidden', 'bg-green-50', 'border-green-500', 'text-green-800');
+                resultPanel.classList.add('bg-red-100', 'border-red-500', 'text-red-800');
+                resultPanel.querySelector('.font-bold').textContent = "Error al Analizar:";
+                resultContent.textContent = `Hubo un problema: ${error.message}. Por favor, inténtalo de nuevo.`;
+            } finally {
+                // 4. Resetear la interfaz
+                loadingIndicator.classList.add('hidden');
+                captureButton.disabled = false;
+                
+                // Volver a mostrar el video y ocultar el canvas
+                canvas.classList.add('hidden');
+                video.classList.remove('hidden');
+                
+                // Restaurar el color del panel si hubo un error previo
+                if (resultPanel.classList.contains('bg-red-100')) {
+                     resultPanel.classList.remove('bg-red-100', 'border-red-500', 'text-red-800');
+                     resultPanel.classList.add('bg-green-50', 'border-green-500', 'text-green-800');
+                     resultPanel.querySelector('.font-bold').textContent = "Resultado Estimado:";
+                }
+            }
+        }
+
+        // Inicialización
+        window.onload = () => {
+            initializeAuth(); // Autenticación (protocolo del entorno)
+            startCamera(); // Iniciar la cámara
+            captureButton.disabled = true; // Deshabilitar hasta que la cámara esté lista
+            captureButton.addEventListener('click', handleCapture);
+        };
+    </script>
+
+</body>
+</html>
